@@ -31,10 +31,12 @@ from pathlib import Path
 from typing import Any
 
 import click
-from dotenv import load_dotenv
+from dotenv import find_dotenv, load_dotenv
 
-# Load .env from CWD upward so the CLI picks up project-local credentials.
-load_dotenv()
+# usecwd=True is required so dotenv walks up from the user's project directory.
+# Without it, find_dotenv walks up from G:\...\InternalScripts\meta\ where this
+# file lives -- and never reaches the user's project .env.
+load_dotenv(find_dotenv(usecwd=True))
 
 from . import __version__
 from .client import MetaAdsAPI
@@ -65,53 +67,165 @@ def _resolve_promoted_object(api: MetaAdsAPI,
     return out
 
 
+def _upload_media_for_ads(api: MetaAdsAPI, ad_sets_cfg: list[dict[str, Any]]
+                           ) -> dict[tuple[int, str], dict[str, Any]]:
+    """Upload all images/videos/thumbnails/carousel-cards across every ad of every ad set.
+
+    Returns a {(ad_set_index, ad_name): media_info} dict where media_info has:
+    - {kind: "image", image_hashes: [hash, ...]}        (1+ images for DC ads)
+    - {kind: "video", video_id, image_hash}             (thumbnail hash)
+    - {kind: "carousel", cards: [{image_hash, link, headline, description}]}
+    """
+    media: dict[tuple[int, str], dict[str, Any]] = {}
+    for as_idx, ad_set_cfg in enumerate(ad_sets_cfg):
+        for ad in ad_set_cfg.get("ads", []):
+            name = ad["name"]
+            key = (as_idx, name)
+            if ad.get("video"):
+                video_path = Path(ad["video"])
+                thumb_path = Path(ad["thumbnail"])
+                click.echo(f"  video:     {video_path.name}")
+                video_id = api.upload_video(video_path)
+                click.echo(f"  thumbnail: {thumb_path.name}")
+                image_hash = api.upload_image(thumb_path)
+                click.echo("  waiting for video to finish processing...")
+                api.wait_for_video_ready(video_id)
+                media[key] = {"kind": "video", "video_id": video_id, "image_hash": image_hash}
+            elif ad.get("cards"):
+                click.echo(f"  carousel:  {name} ({len(ad['cards'])} cards)")
+                cards_with_hashes = []
+                for j, card in enumerate(ad["cards"]):
+                    card_img = Path(card["image"])
+                    click.echo(f"    card[{j}]: {card_img.name}")
+                    cards_with_hashes.append({
+                        "image_hash": api.upload_image(card_img),
+                        "link": card["link"],
+                        "headline": card.get("headline", ""),
+                        "description": card.get("description", ""),
+                    })
+                media[key] = {"kind": "carousel", "cards": cards_with_hashes}
+            else:
+                img = ad["image"]
+                paths = img if isinstance(img, list) else [img]
+                hashes = []
+                for p in paths:
+                    ip = Path(p)
+                    click.echo(f"  image:     {ip.name}")
+                    hashes.append(api.upload_image(ip))
+                media[key] = {"kind": "image", "image_hashes": hashes}
+    return media
+
+
+def _resolve_advantage_creative(ad: dict[str, Any], media_kind: str) -> dict[str, bool] | None:
+    """Return the YAML `advantage_creative` block unchanged (or None if absent).
+
+    No auto-injected defaults -- previously this injected `music: false` for
+    video ads, but ad accounts not enrolled in full Advantage+ Creative reject
+    `music` as an invalid feature key. Auto-injection turned an "opt nothing
+    in" YAML into a "send degrees_of_freedom_spec with music:OPT_OUT" payload
+    that Meta then rejected on restricted accounts.
+
+    If you want music OPT_OUT on a video ad (recommended for UGC with
+    voiceover), set it explicitly: `advantage_creative: {music: false}`.
+    """
+    return dict(ad["advantage_creative"]) if ad.get("advantage_creative") else None
+
+
+def _create_creative_for_ad(api: MetaAdsAPI, ad: dict[str, Any], m: dict[str, Any]) -> str:
+    """Dispatch to the right creative builder based on media kind + text shape."""
+    creative_name = f"{ad['name']} - Creative"
+    advantage = _resolve_advantage_creative(ad, m["kind"])
+    if m["kind"] == "video":
+        return api.create_video_creative(
+            name=creative_name,
+            video_id=m["video_id"],
+            image_hash=m["image_hash"],
+            link=ad["link"],
+            message=ad["primary_text"].strip(),
+            headline=ad.get("headline", ""),
+            description=ad.get("description", ""),
+            cta=ad.get("cta", "LEARN_MORE"),
+            advantage_creative=advantage,
+        )
+    if m["kind"] == "carousel":
+        return api.create_carousel_creative(
+            name=creative_name,
+            cards=m["cards"],
+            link=ad["link"],
+            message=ad["primary_text"].strip(),
+            cta=ad.get("cta", "LEARN_MORE"),
+            advantage_creative=advantage,
+        )
+    # image kind:
+    pt = ad["primary_text"]
+    hl = ad.get("headline", "")
+    desc = ad.get("description", "")
+    is_multi_image = len(m["image_hashes"]) > 1
+    use_dynamic = is_multi_image or any(isinstance(v, list) for v in (pt, hl, desc))
+    if use_dynamic:
+        # Meta rejects degrees_of_freedom_spec on asset_feed_spec (dynamic creative)
+        # ads -- the multi-asset rotation already covers equivalent optimization.
+        # Drop with a warning so a shared YAML can be used for both DC and non-DC.
+        if advantage:
+            click.echo(click.style(
+                f"  warning: dropping advantage_creative on dynamic-creative ad "
+                f"'{ad['name']}' -- Meta rejects degrees_of_freedom_spec on "
+                f"asset_feed_spec ads. DC's native rotation provides equivalent "
+                f"optimization.",
+                fg="yellow",
+            ))
+            advantage = None
+        return api.create_link_creative_dynamic(
+            name=creative_name,
+            image_hashes=m["image_hashes"],
+            link=ad["link"],
+            primary_texts=pt if isinstance(pt, list) else [pt],
+            headlines=hl if isinstance(hl, list) else ([hl] if hl else []),
+            descriptions=(desc if isinstance(desc, list) else [desc]) if desc else None,
+            cta=ad.get("cta", "LEARN_MORE"),
+            advantage_creative=advantage,
+        )
+    return api.create_link_creative(
+        name=creative_name,
+        image_hash=m["image_hashes"][0],
+        link=ad["link"],
+        message=pt.strip(),
+        headline=hl,
+        description=desc,
+        cta=ad.get("cta", "LEARN_MORE"),
+        advantage_creative=advantage,
+    )
+
+
 def create_full_campaign(api: MetaAdsAPI, config: dict[str, Any]) -> dict[str, Any]:
+    """Create one campaign with N ad sets, each with M ads.
+
+    Returns:
+        {
+          "campaign_id": str,
+          "ad_sets": [
+            {"ad_set_id": str, "name": str, "ads": [{"ad_id": str, "creative_id": str, "name": str}, ...]},
+            ...
+          ]
+        }
+    """
     campaign_cfg = config["campaign"]
-    ad_set_cfg = config["ad_set"]
-    ads_cfg = config["ads"]
+    ad_sets_cfg = config["ad_sets"]
     status = campaign_cfg.get("status", "PAUSED")
+    # Pause at the campaign level only -- ad sets + ads stay ACTIVE so a single
+    # `meta activate <campaign_id>` flips everything on without leaving children
+    # paused. (Meta best practice: control delivery with the campaign switch.)
+    child_status = "ACTIVE" if status == "PAUSED" else status
 
-    result: dict[str, Any] = {
-        "campaign_id": None, "ad_set_id": None, "creatives": [], "ads": []
-    }
+    result: dict[str, Any] = {"campaign_id": None, "ad_sets": []}
 
-    # Step 1: Upload media (images / videos / thumbnails / carousel cards)
-    click.echo(click.style("\n[1/4] Upload media", fg="blue", bold=True))
-    media: dict[str, dict[str, Any]] = {}     # name -> {kind, image_hash | video_id | cards}
-    for ad in ads_cfg:
-        name = ad["name"]
-        if ad.get("video"):
-            video_path = Path(ad["video"])
-            thumb_path = Path(ad["thumbnail"])
-            click.echo(f"  video:     {video_path.name}")
-            video_id = api.upload_video(video_path)
-            click.echo(f"  thumbnail: {thumb_path.name}")
-            image_hash = api.upload_image(thumb_path)
-            click.echo("  waiting for video to finish processing...")
-            api.wait_for_video_ready(video_id)
-            media[name] = {"kind": "video", "video_id": video_id, "image_hash": image_hash}
-        elif ad.get("cards"):
-            click.echo(f"  carousel:  {ad['name']} ({len(ad['cards'])} cards)")
-            cards_with_hashes = []
-            for j, card in enumerate(ad["cards"]):
-                card_img = Path(card["image"])
-                click.echo(f"    card[{j}]: {card_img.name}")
-                cards_with_hashes.append({
-                    "image_hash": api.upload_image(card_img),
-                    "link": card["link"],
-                    "headline": card.get("headline", ""),
-                    "description": card.get("description", ""),
-                })
-            media[name] = {"kind": "carousel", "cards": cards_with_hashes}
-        else:
-            image_path = Path(ad["image"])
-            click.echo(f"  image:     {image_path.name}")
-            image_hash = api.upload_image(image_path)
-            media[name] = {"kind": "image", "image_hash": image_hash}
+    # Step 1: Upload all media up-front so creative errors don't waste API quota.
+    click.echo(click.style("\n[1] Upload media", fg="blue", bold=True))
+    media = _upload_media_for_ads(api, ad_sets_cfg)
     click.echo(click.style("  done", fg="green"))
 
-    # Step 2: Campaign
-    click.echo(click.style("\n[2/4] Create campaign", fg="blue", bold=True))
+    # Step 2: Create the campaign.
+    click.echo(click.style("\n[2] Create campaign", fg="blue", bold=True))
     click.echo(f"  Name: {campaign_cfg['name']}")
     campaign_has_cbo = bool(campaign_cfg.get("daily_budget") or campaign_cfg.get("lifetime_budget"))
     if campaign_has_cbo:
@@ -130,76 +244,76 @@ def create_full_campaign(api: MetaAdsAPI, config: dict[str, Any]) -> dict[str, A
     )
     click.echo(click.style(f"  campaign_id={result['campaign_id']}", fg="green"))
 
-    # Step 3: Ad set
-    click.echo(click.style("\n[3/4] Create ad set", fg="blue", bold=True))
-    click.echo(f"  Name: {ad_set_cfg['name']}")
-    if ad_set_cfg.get("daily_budget"):
-        click.echo(f"  Budget: ${int(ad_set_cfg['daily_budget']) / 100:.2f}/day")
-    else:
-        click.echo("  Budget: (inherits from campaign CBO)")
-    promoted_object = _resolve_promoted_object(api, ad_set_cfg.get("promoted_object"))
-    if promoted_object:
-        click.echo(f"  Promoted object: {promoted_object}")
-    if ad_set_cfg.get("start_time"):
-        click.echo(f"  Start: {ad_set_cfg['start_time']}")
-    if ad_set_cfg.get("end_time"):
-        click.echo(f"  End:   {ad_set_cfg['end_time']}")
-    result["ad_set_id"] = api.create_ad_set(
-        name=ad_set_cfg["name"],
-        campaign_id=result["campaign_id"],
-        daily_budget=ad_set_cfg.get("daily_budget"),
-        targeting=ad_set_cfg.get("targeting", {}),
-        optimization_goal=ad_set_cfg.get("optimization_goal", "LINK_CLICKS"),
-        billing_event=ad_set_cfg.get("billing_event", "IMPRESSIONS"),
-        bid_strategy=ad_set_cfg.get("bid_strategy", "LOWEST_COST_WITHOUT_CAP"),
-        status=status,
-        promoted_object=promoted_object,
-        start_time=ad_set_cfg.get("start_time"),
-        end_time=ad_set_cfg.get("end_time"),
-    )
-    click.echo(click.style(f"  ad_set_id={result['ad_set_id']}", fg="green"))
-
-    # Step 4: Creatives + ads
-    click.echo(click.style("\n[4/4] Create ads", fg="blue", bold=True))
-    for ad in ads_cfg:
-        click.echo(f"  {ad['name']}")
-        m = media[ad["name"]]
-        if m["kind"] == "video":
-            creative_id = api.create_video_creative(
-                name=f"{ad['name']} - Creative",
-                video_id=m["video_id"],
-                image_hash=m["image_hash"],
-                link=ad["link"],
-                message=ad["primary_text"].strip(),
-                headline=ad.get("headline", ""),
-                description=ad.get("description", ""),
-                cta=ad.get("cta", "LEARN_MORE"),
-            )
-        elif m["kind"] == "carousel":
-            creative_id = api.create_carousel_creative(
-                name=f"{ad['name']} - Creative",
-                cards=m["cards"],
-                link=ad["link"],
-                message=ad["primary_text"].strip(),
-                cta=ad.get("cta", "LEARN_MORE"),
-            )
+    # Step 3+: For each ad set, create ad set + its ads.
+    for as_idx, ad_set_cfg in enumerate(ad_sets_cfg):
+        ads_cfg = ad_set_cfg.get("ads", [])
+        click.echo(click.style(
+            f"\n[3.{as_idx + 1}] Create ad set: {ad_set_cfg['name']}",
+            fg="blue", bold=True,
+        ))
+        if ad_set_cfg.get("daily_budget"):
+            click.echo(f"  Budget: ${int(ad_set_cfg['daily_budget']) / 100:.2f}/day")
         else:
-            creative_id = api.create_link_creative(
-                name=f"{ad['name']} - Creative",
-                image_hash=m["image_hash"],
-                link=ad["link"],
-                message=ad["primary_text"].strip(),
-                headline=ad.get("headline", ""),
-                description=ad.get("description", ""),
-                cta=ad.get("cta", "LEARN_MORE"),
-            )
-        result["creatives"].append(creative_id)
-        ad_id = api.create_ad(
-            name=ad["name"], adset_id=result["ad_set_id"],
-            creative_id=creative_id, status=status,
+            click.echo("  Budget: (inherits from campaign CBO)")
+        promoted_object = _resolve_promoted_object(api, ad_set_cfg.get("promoted_object"))
+        if promoted_object:
+            click.echo(f"  Promoted object: {promoted_object}")
+        if ad_set_cfg.get("start_time"):
+            click.echo(f"  Start: {ad_set_cfg['start_time']}")
+        if ad_set_cfg.get("end_time"):
+            click.echo(f"  End:   {ad_set_cfg['end_time']}")
+        # Auto-detect dynamic-creative requirement. YAML can override explicitly via
+        # ad_set.is_dynamic_creative.
+        needs_dc = any(
+            isinstance(a.get("primary_text"), list)
+            or isinstance(a.get("headline"), list)
+            or isinstance(a.get("description"), list)
+            or isinstance(a.get("image"), list)
+            for a in ads_cfg
         )
-        result["ads"].append(ad_id)
-        click.echo(click.style(f"    creative={creative_id} ad={ad_id}", fg="green"))
+        is_dc = ad_set_cfg.get("is_dynamic_creative", needs_dc)
+        if is_dc:
+            click.echo("  Dynamic creative: true (asset_feed_spec ads in this ad set)")
+        ad_set_id = api.create_ad_set(
+            name=ad_set_cfg["name"],
+            campaign_id=result["campaign_id"],
+            daily_budget=ad_set_cfg.get("daily_budget"),
+            targeting=ad_set_cfg.get("targeting", {}),
+            optimization_goal=ad_set_cfg.get("optimization_goal", "LINK_CLICKS"),
+            billing_event=ad_set_cfg.get("billing_event", "IMPRESSIONS"),
+            bid_strategy=ad_set_cfg.get("bid_strategy", "LOWEST_COST_WITHOUT_CAP"),
+            status=child_status,
+            promoted_object=promoted_object,
+            start_time=ad_set_cfg.get("start_time"),
+            end_time=ad_set_cfg.get("end_time"),
+            is_dynamic_creative=is_dc,
+        )
+        click.echo(click.style(f"  ad_set_id={ad_set_id}", fg="green"))
+
+        ad_set_result: dict[str, Any] = {
+            "ad_set_id": ad_set_id,
+            "name": ad_set_cfg["name"],
+            "ads": [],
+        }
+
+        click.echo(click.style(
+            f"\n[4.{as_idx + 1}] Create ads in {ad_set_cfg['name']}",
+            fg="blue", bold=True,
+        ))
+        for ad in ads_cfg:
+            click.echo(f"  {ad['name']}")
+            m = media[(as_idx, ad["name"])]
+            creative_id = _create_creative_for_ad(api, ad, m)
+            ad_id = api.create_ad(
+                name=ad["name"], adset_id=ad_set_id,
+                creative_id=creative_id, status=child_status,
+            )
+            ad_set_result["ads"].append({
+                "ad_id": ad_id, "creative_id": creative_id, "name": ad["name"],
+            })
+            click.echo(click.style(f"    creative={creative_id} ad={ad_id}", fg="green"))
+
+        result["ad_sets"].append(ad_set_result)
 
     return result
 
@@ -210,6 +324,40 @@ def create_full_campaign(api: MetaAdsAPI, config: dict[str, Any]) -> dict[str, A
 @click.version_option(version=__version__, prog_name="meta")
 def cli() -> None:
     """Custom Meta Ads CLI (Facebook + Instagram). See `meta COMMAND --help`."""
+
+
+def _summarise_config(cfg: dict[str, Any]) -> None:
+    """Print a short summary of a validated config to stdout."""
+    click.echo(f"  Campaign:    {cfg['campaign']['name']}")
+    if cfg['campaign'].get('daily_budget'):
+        click.echo(f"  Budget:      ${int(cfg['campaign']['daily_budget']) / 100:.2f}/day (CBO)")
+    elif cfg['campaign'].get('lifetime_budget'):
+        click.echo(f"  Budget:      ${int(cfg['campaign']['lifetime_budget']) / 100:.2f} lifetime (CBO)")
+    else:
+        first_budget = cfg['ad_sets'][0].get('daily_budget', 0)
+        click.echo(f"  Budget:      ${int(first_budget) / 100:.2f}/day per ad set (ABO)")
+    ad_sets = cfg['ad_sets']
+    click.echo(f"  Ad sets:     {len(ad_sets)}")
+    total_ads = sum(len(s.get('ads', [])) for s in ad_sets)
+    n_video = sum(1 for s in ad_sets for ad in s.get('ads', []) if ad.get('video'))
+    n_carousel = sum(1 for s in ad_sets for ad in s.get('ads', []) if ad.get('cards'))
+    n_image = total_ads - n_video - n_carousel
+    click.echo(f"  Ads (total): {total_ads} ({n_image} image, {n_video} video, {n_carousel} carousel)")
+    for i, s in enumerate(ad_sets):
+        flags = []
+        if s.get('is_dynamic_creative'):
+            flags.append("dynamic")
+        if any(isinstance(a.get('image'), list) for a in s.get('ads', [])):
+            flags.append("multi-image")
+        if any(isinstance(a.get('primary_text'), list) or isinstance(a.get('headline'), list)
+               for a in s.get('ads', [])):
+            flags.append("multi-text")
+        flag_str = f"  [{', '.join(flags)}]" if flags else ""
+        click.echo(f"    ad_sets[{i}]: {s['name']} ({len(s.get('ads', []))} ads){flag_str}")
+        if s.get('promoted_object'):
+            click.echo(f"      promoted: {s['promoted_object']}")
+        if s.get('start_time') or s.get('end_time'):
+            click.echo(f"      window:   {s.get('start_time', '-')} -> {s.get('end_time', '-')}")
 
 
 @cli.command()
@@ -223,22 +371,7 @@ def validate(config_path: str) -> None:
         click.echo(click.style(f"Validation failed:\n{e}", fg="red"))
         sys.exit(1)
     click.echo(click.style("Config is valid.", fg="green"))
-    click.echo(f"  Campaign: {cfg['campaign']['name']}")
-    if cfg['campaign'].get('daily_budget'):
-        click.echo(f"  Budget:   ${int(cfg['campaign']['daily_budget']) / 100:.2f}/day (CBO)")
-    elif cfg['campaign'].get('lifetime_budget'):
-        click.echo(f"  Budget:   ${int(cfg['campaign']['lifetime_budget']) / 100:.2f} lifetime (CBO)")
-    else:
-        click.echo(f"  Budget:   ${int(cfg['ad_set']['daily_budget']) / 100:.2f}/day (ABO)")
-    n_video = sum(1 for a in cfg['ads'] if a.get('video'))
-    n_carousel = sum(1 for a in cfg['ads'] if a.get('cards'))
-    n_image = len(cfg['ads']) - n_video - n_carousel
-    click.echo(f"  Ads:      {len(cfg['ads'])} ({n_image} image, {n_video} video, {n_carousel} carousel)")
-    if cfg['ad_set'].get('promoted_object'):
-        click.echo(f"  Promoted: {cfg['ad_set']['promoted_object']}")
-    if cfg['ad_set'].get('start_time') or cfg['ad_set'].get('end_time'):
-        click.echo(f"  Window:   {cfg['ad_set'].get('start_time', '-')} -> "
-                   f"{cfg['ad_set'].get('end_time', '-')}")
+    _summarise_config(cfg)
 
 
 @cli.command()
@@ -246,7 +379,7 @@ def validate(config_path: str) -> None:
 @click.option("--dry-run", is_flag=True, help="Don't hit the API; print what would happen.")
 @click.option("--yes", "-y", is_flag=True, help="Skip 'will create real ads' confirmation.")
 def create(config_path: str, dry_run: bool, yes: bool) -> None:
-    """Create campaign + ad set + ads from a YAML (PAUSED by default)."""
+    """Create campaign + ad sets + ads from a YAML (PAUSED by default)."""
     try:
         config = validate_config(load_config(config_path))
     except ConfigError as e:
@@ -256,16 +389,9 @@ def create(config_path: str, dry_run: bool, yes: bool) -> None:
     click.echo(click.style("=" * 50, fg="blue"))
     click.echo(click.style("meta create", fg="blue", bold=True))
     click.echo(click.style("=" * 50, fg="blue"))
-    click.echo(f"Campaign: {config['campaign']['name']}")
-    if config['campaign'].get('daily_budget'):
-        click.echo(f"Budget:   ${int(config['campaign']['daily_budget']) / 100:.2f}/day (CBO)")
-    elif config['campaign'].get('lifetime_budget'):
-        click.echo(f"Budget:   ${int(config['campaign']['lifetime_budget']) / 100:.2f} lifetime (CBO)")
-    else:
-        click.echo(f"Budget:   ${int(config['ad_set']['daily_budget']) / 100:.2f}/day (ABO)")
-    click.echo(f"Ads:      {len(config['ads'])}")
-    click.echo(f"Status:   {config['campaign'].get('status', 'PAUSED')}")
-    click.echo(f"Mode:     {'DRY RUN' if dry_run else 'LIVE'}")
+    _summarise_config(config)
+    click.echo(f"  Status:      {config['campaign'].get('status', 'PAUSED')}")
+    click.echo(f"  Mode:        {'DRY RUN' if dry_run else 'LIVE'}")
 
     if not dry_run and not yes:
         if not click.confirm(click.style("Create real campaigns?", fg="yellow")):
@@ -283,8 +409,9 @@ def create(config_path: str, dry_run: bool, yes: bool) -> None:
     click.echo(click.style("Done", fg="green", bold=True))
     click.echo(click.style("=" * 50, fg="green"))
     click.echo(f"  Campaign: {result['campaign_id']}")
-    click.echo(f"  Ad Set:   {result['ad_set_id']}")
-    click.echo(f"  Ads:      {len(result['ads'])}")
+    click.echo(f"  Ad sets:  {len(result['ad_sets'])}")
+    for s in result['ad_sets']:
+        click.echo(f"    {s['ad_set_id']}  {s['name']}  ({len(s['ads'])} ads)")
     if not dry_run:
         click.echo(
             f"\n  Ads Manager:\n"

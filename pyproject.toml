@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "meta-ads-cli"
-version = "0.1.0"
+version = "0.5.4"
 description = "CLI for the Meta Marketing API (Facebook + Instagram ads) -- custom wrapper over Graph API v21"
 requires-python = ">=3.9"
 dependencies = [
